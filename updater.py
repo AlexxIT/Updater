@@ -7,7 +7,6 @@ python updated.py - check updated once an hour, exit with 0 if no updates
 import io
 import json
 import re
-import sys
 import time
 import traceback
 import zipfile
@@ -15,100 +14,175 @@ from pathlib import Path
 
 from requests import Session
 
-__version__ = 'v1.0.0'
+__version__ = 'v1.1.0'
 
-script = Path(__file__)
-cwd = script.parent
 
-# check we in config folder
-if not (cwd / 'configuration.yaml').exists():
-    exit(0)
+def run(command: str = 'code', interval: int = 0, repos: list = None):
+    """
+    :param command:
+        - update - update components to latest versions
+        - json - prints json with new components versions
+        - code - return count of updates as app result code
+    :param interval: returns the cache if it is not older than the interval in
+        seconds. interval<0 disables cache (updater.json) file creation.
+    :param repos: list of repositories for updates in "username/repo" or
+        "username/repo tree" formats. If empty, the list will be parsed from
+        the (updater.txt) file.
+    """
+    script = Path(__file__)
+    cwd = script.parent
 
-# support custom scriptname
-config = cwd / script.name.replace('.py', '.txt')
-if not config.exists():
-    config.write_text('')
-    exit(0)
+    # check script is in config folder
+    if not (cwd / 'configuration.yaml').exists():
+        return
 
-cache = cwd / script.name.replace('.py', '.json')
+    # cache file to prevent refresh versions every minute
+    cache = cwd / script.name.replace('.py', '.json')
 
-command = sys.argv[1] if len(sys.argv) == 2 else None
-if command is None:
-    interval = globals().get('interval', 60 * 60)
-    if cache.exists() and time.time() < cache.stat().st_mtime + interval:
-        raw = json.loads(cache.read_bytes())
-        exit(len(raw['repositories']))  # 0 - no updates
+    # if interval - check cache file time
+    if interval and cache.exists() and \
+            time.time() < cache.stat().st_mtime + interval:
+        if command == 'json':
+            print(cache.read_text())
+        elif command == 'code':
+            raw = json.loads(cache.read_text())
+            exit(len(raw['repositories']))  # 0 - no updates
+        return
 
-session = Session()
-repositories = []
+    session = Session()
+    repositories = []
 
-raw = config.read_text()
-for name, new_ver in re.findall(
-        r"https://github.com/([\w-]+/[\w-]+)(?: +([\w.-]+))?", raw
-):
-    try:
-        url = "https://github.com/" + name
+    if not repos:
+        # support custom scriptname
+        config = cwd / script.name.replace('.py', '.txt')
+        if not config.exists():
+            # create empty file and exit if first run
+            config.write_text('')
+            return
 
-        if not new_ver:
-            # load version
-            r = session.get(url + "/releases/latest", allow_redirects=False)
-            # ver will return `releases` in no releases in repo
-            _, new_ver = r.headers.get("location").rsplit("/", 1)
+        # read file with urls
+        raw = config.read_text()
+    else:
+        raw = '\n'.join(repos) if isinstance(repos, list) else repos
 
-        if new_ver in ('releases', 'master'):
-            zip_url = f"{url}/archive/refs/heads/master.zip"
-            r = session.get(url + "/tree/master")
-            # get ver from commit hash
-            new_ver = re.search('/tree/([a-f0-9]{7})', r.text)[1]
-        else:
-            zip_url = f"{url}/archive/refs/tags/{new_ver}.zip"
-            r = session.get(f"{url}/tree/{new_ver}")
+    repos = re.findall(
+        r"^(?:https://github.com/)?([\w-]+/[\w-]+)(?:[ @]+([\w.-]+))?",
+        raw, flags=re.MULTILINE
+    )
 
-        folder = re.search(r'href=".+/custom_components/(\w+)"', r.text)[1]
+    # name: AlexxIT/SonoffLAN, tree: branch or tag name
+    for name, tree in repos:
+        try:
+            url = "https://github.com/" + name
 
-        # check installed version
-        ver_path = cwd / 'custom_components' / folder / 'version.txt'
-        cur_ver = ver_path.read_text() if ver_path.exists() else '-'
-        if cur_ver == new_ver:
-            # print(folder, "up to date")
-            continue
+            if not tree:
+                # if not tree - get latest release version from redirect
+                r = session.get(url + "/releases/latest",
+                                allow_redirects=False)
+                _, tree = r.headers.get("location").rsplit("/", 1)
 
-        if command == 'update':
-            r = session.get(zip_url)
-            raw = io.BytesIO(r.content)
-            zf = zipfile.ZipFile(raw)
-            for file in zf.filelist:
-                if 'custom_components' not in file.filename:
-                    continue
+            # will return `releases` if no releases in repo, so loads root
+            # branches and tags has same link to page
+            r = session.get(
+                url if tree == 'releases' else f"{url}/tree/{tree}"
+            )
 
-                # remove archive name from path
-                _, zip_path = file.filename.split('/', 1)
-                zip_path = cwd / zip_path
+            # check if tree is branch or tag
+            m = re.search(r'id="branch-select-menu">.+?</summary>', r.text,
+                          flags=re.DOTALL)[0]
+            if 'octicon-git-branch' in m:
+                if tree == 'releases':
+                    # get tree name, because we in repo root
+                    tree = re.search(r'data-menu-button>([^<]+)</span>', m)[1]
 
-                if file.is_dir():
-                    zip_path.mkdir(exist_ok=True)
-                else:
-                    raw = zf.read(file)
-                    zip_path.write_bytes(raw)
+                zip_url = f"{url}/archive/refs/heads/{tree}.zip"
+                # get ver from commit hash
+                new_ver = re.search('/tree/([a-f0-9]{7})', r.text)[1]
 
-            ver_path.write_text(new_ver)
+            elif 'octicon-tag' in m and tree != 'releases':
+                zip_url = f"{url}/archive/refs/tags/{tree}.zip"
+                # use ver from tag name
+                new_ver = tree
 
-            print(folder, "updated to", new_ver)
+            else:
+                raise RuntimeError
 
-        else:
-            repositories.append({
-                'name': name,
-                'installed_version': cur_ver,
-                'available_version': new_ver,
-            })
+            # get custom component folder from repo listing
+            m = re.search(r'href=".+?/custom_components/(\w+)"', r.text)
+            if m:
+                # files in custom_components folder
+                domain = m[1]
+                zip_root = cwd
 
-    except:
-        traceback.print_exc()
+            elif f"/{name}/blob/{tree}/manifest.json" in r.text:
+                # files in root folder
+                r = session.get(
+                    f"https://raw.github.com/{name}/{tree}/manifest.json"
+                )
+                domain = r.json()['domain']
+                zip_root = cwd / 'custom_components' / domain
 
-raw = json.dumps({'repositories': repositories})
-cache.write_text(raw)
+            else:
+                raise NotImplementedError
 
-if command == 'json':
-    print(raw)
-elif command is None:
-    exit(len(repositories))  # 0 - no updates
+            # check installed version
+            ver_path = cwd / 'custom_components' / domain / 'version.txt'
+            cur_ver = ver_path.read_text() if ver_path.exists() else '-'
+            if cur_ver == new_ver:
+                # print(folder, "up to date")
+                continue
+
+            if command == 'update':
+                r = session.get(zip_url)
+                raw = io.BytesIO(r.content)
+                zf = zipfile.ZipFile(raw)
+                for file in zf.filelist:
+                    # remove archive name from path
+                    _, zip_path = file.filename.split('/', 1)
+                    zip_path = zip_root / zip_path
+
+                    if 'custom_components' not in zip_path.parts:
+                        continue
+
+                    if file.is_dir():
+                        zip_path.mkdir(exist_ok=True)
+                    else:
+                        raw = zf.read(file)
+                        zip_path.write_bytes(raw)
+
+                ver_path.write_text(new_ver)
+
+                print(domain, "updated to", tree)
+
+            else:
+                repositories.append({
+                    'name': name,
+                    'installed_version': cur_ver,
+                    'available_version': new_ver,
+                })
+
+        except:
+            traceback.print_exc()
+
+    raw = json.dumps({'repositories': repositories})
+    if interval >= 0:
+        cache.write_text(raw)
+    if command == 'json':
+        print(raw)
+    elif command == 'code':
+        exit(len(repositories))  # 0 - no updates
+
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-v', action='version', version=__version__)
+    parser.add_argument('command', nargs='?', default='code',
+                        choices=('code', 'json', 'update'))
+    parser.add_argument('-i', '--interval', type=int, default=0, metavar='0',
+                        help="cache interval")
+    parser.add_argument('repos', nargs='*', help="format: user/repo tree")
+    args = parser.parse_args()
+
+    run(**args.__dict__)
