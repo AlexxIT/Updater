@@ -14,7 +14,7 @@ from pathlib import Path
 
 from requests import Session
 
-__version__ = 'v1.1.0'
+__version__ = 'v1.1.1'
 
 
 def run(command: str = 'code', interval: int = 0, repos: list = None):
@@ -123,7 +123,19 @@ def run(command: str = 'code', interval: int = 0, repos: list = None):
                 zip_root = cwd / 'custom_components' / domain
 
             else:
-                raise NotImplementedError
+                # try to check custom_components folder
+                r = session.get(f"{url}/tree/{tree}/custom_components")
+                if not r.ok:
+                    continue
+                m = re.findall(
+                    rf'href="/{name}/tree/{tree}/custom_components/([^"]+)"',
+                    r.text
+                )
+                # if only one folder in custom_components folder
+                if len(m) != 1:
+                    continue
+                domain = m[0]
+                zip_root = cwd
 
             # check installed version
             ver_path = cwd / 'custom_components' / domain / 'version.txt'
@@ -141,12 +153,15 @@ def run(command: str = 'code', interval: int = 0, repos: list = None):
                     _, zip_path = file.filename.split('/', 1)
                     zip_path = zip_root / zip_path
 
+                    # skip files and folders not in custom_components folder
                     if 'custom_components' not in zip_path.parts:
                         continue
 
+                    # support create custom_components folder if it not exists
                     if file.is_dir():
                         zip_path.mkdir(exist_ok=True)
-                    else:
+                    # skip files not in custom_components/domain folder
+                    elif domain in zip_path.parts:
                         raw = zf.read(file)
                         zip_path.write_bytes(raw)
 
